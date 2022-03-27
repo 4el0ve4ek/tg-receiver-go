@@ -12,8 +12,9 @@ import (
 )
 
 type Bot struct {
-	controller   []receivers.IController
-	messagesChan chan *model.TelegramMessage
+	controller []receivers.Controller
+	messages   chan *model.TelegramMessage
+	done       chan struct{}
 }
 
 // New generate tg bot and all bot-receivers for him
@@ -22,11 +23,13 @@ func New() *Bot {
 	VkController := receivers.NewVkBot(messageChan, store.NewTgVk())
 
 	return &Bot{
-		controller:   []receivers.IController{VkController},
-		messagesChan: messageChan,
+		controller: []receivers.Controller{VkController},
+		messages:   messageChan,
+		done:       make(chan struct{}),
 	}
 }
 
+// Start working process
 func (b *Bot) Start() {
 	bot, err := tgbotapi.NewBotAPI(os.Getenv("tg_token"))
 	if err != nil {
@@ -37,12 +40,40 @@ func (b *Bot) Start() {
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-
-	updates := bot.GetUpdatesChan(u)
-
 	go b.observe(bot)
+
+	go b.checkUpdates(bot)
+}
+
+// Stop working of bot
+func (b *Bot) Stop() {
+	close(b.done)
+}
+
+// waits for messages and send them to TG
+func (b *Bot) observe(bot *tgbotapi.BotAPI) {
+	for {
+		select {
+		case msg := <-b.messages:
+			for _, tgMsg := range ConvertModel(msg) {
+				_, err := bot.Send(tgMsg)
+				if err != nil {
+					log.Print(err)
+				}
+			}
+		case <-b.done:
+			log.Print("Stops sending message")
+			return
+		}
+	}
+}
+
+// receives messages
+func (b *Bot) checkUpdates(tg *tgbotapi.BotAPI) {
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 45
+
+	updates := tg.GetUpdatesChan(u)
 
 	for update := range updates {
 		if update.Message == nil {
@@ -53,38 +84,30 @@ func (b *Bot) Start() {
 
 		chatID := update.Message.Chat.ID
 
-		var curController receivers.IController
+		var curController receivers.Controller
 
 		for _, controller := range b.controller {
 			if controller.Validate(link) {
 				curController = controller
 			}
 		}
+
 		if curController == nil {
-			bot.Send(tgbotapi.NewMessage(chatID, "invalid link"))
+			tg.Send(tgbotapi.NewMessage(chatID, "Invalid link or command. Please read instructions first."))
 			continue
 		}
+
+		var response string
 		switch command {
 		case "/link":
-			response := curController.Link(link, chatID)
-			bot.Send(tgbotapi.NewMessage(chatID, response))
+			response = curController.Link(link, chatID)
+		case "/unlink":
+			response = curController.UnLink(link, chatID)
+		default:
+			response = "Invalid command. Read instructions first"
 		}
 
-	}
-}
-
-// waits for messages and send them to TG
-func (b *Bot) observe(bot *tgbotapi.BotAPI) {
-	for {
-		select {
-		case msg := <-b.messagesChan:
-			for _, tgMsg := range ConvertModel(msg) {
-				_, err := bot.Send(tgMsg)
-				if err != nil {
-					log.Print(err)
-				}
-			}
-		}
+		tg.Send(tgbotapi.NewMessage(chatID, response))
 	}
 }
 
@@ -110,19 +133,6 @@ func ConvertModel(modelMessage *model.TelegramMessage) []tgbotapi.Chattable {
 
 	}
 	return messages
-}
-
-//allowCommands contains valid command
-var allowCommands = []string{"/sub", "/unsub", "/link", "unlink"}
-
-// check that command is one of allowed
-func isCommandValid(command string) bool {
-	for _, com := range allowCommands {
-		if com == command {
-			return true
-		}
-	}
-	return false
 }
 
 // splits the message for command part and link part

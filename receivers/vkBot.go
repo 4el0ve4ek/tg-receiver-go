@@ -2,6 +2,7 @@ package receivers
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math/rand"
 	"os"
@@ -18,14 +19,12 @@ import (
 	"tg-receiver-bot/store"
 )
 
-type IController interface {
+type Controller interface {
 	Validate(url string) bool
 
-	Subscribe(url string, tgID int64) (response string)
 	Link(url string, tgID int64) (response string)
 
 	UnLink(url string, tgID int64) (response string)
-	UnSubscribe(url string, tgID int64) (response string)
 }
 
 type linkingValidation struct {
@@ -34,73 +33,57 @@ type linkingValidation struct {
 }
 
 type vkBot struct {
-	bot               *api.VK
-	id                int
-	db                *store.TgVkLinker
+	apiVK             *api.VK
+	db                store.Store
 	waitingAcceptance map[int64]linkingValidation
 	messageChan       chan<- *model.TelegramMessage
 }
 
+// UnLink tg chat from vk user
 func (v *vkBot) UnLink(url string, tgID int64) string {
-	//TODO implement me
-	panic("implement me")
+	userId := fetchVKID(url)
+	log.Println("Trying unlink to ", userId)
+
+	user, err := v.fetchUser(userId)
+
+	if err != nil {
+		return err.Error()
+	}
+	v.db.UnSubscribe(tgID, int64(user.ID))
+
+	return "Done"
 }
 
-func (v *vkBot) UnSubscribe(url string, tgID int64) string {
-	//TODO implement me
-	panic("implement me")
-}
-
+// Validate if url is vk link
 func (v *vkBot) Validate(s string) bool {
 	matched, _ := regexp.MatchString(`https?://vk\.com/.+`, s)
 	return matched
 }
 
-func (v *vkBot) Subscribe(url string, tgID int64) string {
-	groupId := fetchId(url)
-	log.Println(groupId)
-
-	response, err := v.bot.GroupsGetByID(api.Params{"group_id": groupId})
-
-	if err != nil {
-		return err.Error()
-	}
-	if len(response) == 0 || response[0].ID == v.id {
-		return "invalid group ID or u try subscribe for sender"
-	}
-	log.Println(response[0].Name)
-
-	return "Success"
-}
-
+// Link vk user and tg chat
 func (v *vkBot) Link(url string, tgID int64) string {
-	userId := fetchId(url)
-	log.Println(userId)
+	userId := fetchVKID(url)
+	log.Println("Trying link to ", userId)
 
-	users, err := v.bot.UsersGet(api.Params{"user_ids": userId})
+	user, err := v.fetchUser(userId)
 
 	if err != nil {
 		return err.Error()
 	}
-
-	if len(users) == 0 {
-		return "invalid user id"
-	}
-	log.Println(users[0].FirstName + " " + users[0].LastName)
 
 	hashValidator := strconv.FormatInt(rand.Int63(), 10)
-	v.waitingAcceptance[int64(users[0].ID)] = linkingValidation{hashValidator, tgID}
+	v.waitingAcceptance[int64(user.ID)] = linkingValidation{hashValidator, tgID}
 
 	return "Ok. Now write to him () next message \"accept " + hashValidator + "\""
 }
 
 // parses url to get group or user id
-func fetchId(s string) string {
+func fetchVKID(s string) string {
 	re, _ := regexp.Compile(`https?://vk\.com/(.+)`)
 	return re.FindStringSubmatch(s)[1]
 }
 
-func NewVkBot(messageChan chan<- *model.TelegramMessage, linker *store.TgVkLinker) (bot *vkBot) {
+func NewVkBot(messageChan chan<- *model.TelegramMessage, linker store.Store) (bot *vkBot) {
 	vk := api.NewVK(os.Getenv("vk_token"))
 
 	group, err := vk.GroupsGetByID(api.Params{})
@@ -108,15 +91,20 @@ func NewVkBot(messageChan chan<- *model.TelegramMessage, linker *store.TgVkLinke
 		log.Fatal(err)
 	}
 
-	bot = &vkBot{bot: vk, id: group[0].ID,
-		db: linker, messageChan: messageChan,
-		waitingAcceptance: make(map[int64]linkingValidation)}
+	bot = &vkBot{
+		apiVK:             vk,
+		db:                linker,
+		messageChan:       messageChan,
+		waitingAcceptance: make(map[int64]linkingValidation),
+	}
 
 	lp, err := longpoll.NewLongPoll(vk, group[0].ID)
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	lp.MessageNew(bot.newMessageReceive)
+
 	go func() {
 		if err := lp.Run(); err != nil {
 			log.Fatal(err)
@@ -126,45 +114,62 @@ func NewVkBot(messageChan chan<- *model.TelegramMessage, linker *store.TgVkLinke
 	return
 }
 
+// validates all incoming messages
 func (v *vkBot) newMessageReceive(_ context.Context, obj events.MessageNewObject) {
-
-	b := params.NewMessagesSendBuilder()
-	b.Message("Trying to send... check your Telegram")
-	b.RandomID(0)
-	b.PeerID(obj.Message.PeerID)
-
+	log.Println("VK message from ", obj.Message.PeerID, ". MID: ", obj.Message.ID)
 	if strings.HasPrefix(obj.Message.Text, "accept") {
 		acceptanceWord := strings.SplitN(obj.Message.Text, " ", 2)
 		v.acceptLink(int64(obj.Message.PeerID), acceptanceWord[1])
+		return
 	}
-	telegramMessages := parseMessageContaining(obj.Message)
 
-	telegramMessages.ChatIds = v.db.ToTgChatID(int64(obj.Message.PeerID))
+	messagesToTG := parseMessageContaining(obj.Message)
 
-	v.messageChan <- telegramMessages
+	messagesToTG.ChatIds = v.db.ToTgChatID(int64(obj.Message.PeerID))
 
-	_, err := v.bot.MessagesSend(b.Params)
-	if err != nil {
-		log.Fatal(err)
-	}
+	v.messageChan <- messagesToTG
+
 }
 
+// accepts linking of vk and tg chats
 func (v *vkBot) acceptLink(vkID int64, acceptance string) {
 	var validator linkingValidation
 	var ok bool
+
+	b := params.NewMessagesSendBuilder()
+	b.RandomID(0)
+	b.PeerID(int(vkID))
+
 	if validator, ok = v.waitingAcceptance[vkID]; !ok {
-		return
+		b.Message("Nobody to accept.")
+	} else if validator.hash != acceptance {
+		b.Message("Invalid hash word.")
+	} else {
+		log.Println(vkID, " linked with ", validator.tgID)
+		v.db.Subscribe(validator.tgID, vkID)
+		delete(v.waitingAcceptance, vkID)
+		b.Message("Successfully linked!")
 	}
-	if validator.hash != acceptance {
-		return
+
+	_, err := v.apiVK.MessagesSend(b.Params)
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+// auxiliary function to get vk user by its id
+func (v *vkBot) fetchUser(id string) (*object.UsersUser, error) {
+	users, err := v.apiVK.UsersGet(api.Params{"user_ids": id})
+
+	if err != nil {
+		return nil, err
 	}
 
-	log.Println(vkID)
-	log.Println(validator.tgID)
+	if len(users) == 0 {
+		return nil, errors.New("invalid user id")
+	}
 
-	v.db.MakeSubscribe(validator.tgID, vkID)
-
-	delete(v.waitingAcceptance, vkID)
+	return &users[0], nil
 }
 
 // parses message to model.TelegramMessage

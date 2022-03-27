@@ -1,0 +1,13 @@
+version: "3.8"
+services:
+  tg-bot-go:
+    build: .
+    environment:
+      MONGODB_URI: "mongodb://db:27017/"
+  db:
+    image: mongo:4.2.11
+#    ports:
+#      - target: 27017
+#        published: 27017
+#        protocol: tcp
+#        mode: host

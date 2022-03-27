@@ -5,6 +5,7 @@
 # directory structure
 bin/*
 pkg/*
+logs/*
 !.gitkeep
 
 # goop - go package manager
